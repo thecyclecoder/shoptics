@@ -659,21 +659,49 @@ export async function syncQB(): Promise<SyncResult[]> {
 }
 
 // Amazon sales snapshot — fetches report for last 7 days, re-snapshots to catch status updates
-export async function syncAmazonSalesSnapshot(): Promise<SyncResult> {
+export async function syncAmazonSalesSnapshot(
+  startDateStr?: string,
+  endDateStr?: string
+): Promise<SyncResult> {
   const logId = await startLog("syncAmazonSalesSnapshot");
   try {
     const supabase = createServiceClient();
 
-    // Fetch report for last 7 days (2-day lag means we start from 9 days ago to 2 days ago)
-    const endDate = new Date();
-    endDate.setDate(endDate.getDate() - 2);
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 9);
+    // Sale-date window in marketplace-local dates (Pacific for US).
+    // Default cron mode: target [today-9, today-2] local — gives 2-day lag for new
+    // orders to settle and 7 days of re-pull to catch Pending → Shipped transitions.
+    // Backfill mode: pass explicit start+end.
+    const endDate = endDateStr || (() => {
+      const d = new Date();
+      d.setDate(d.getDate() - 2);
+      return d.toISOString().split("T")[0];
+    })();
+    const startDate = startDateStr || (() => {
+      const d = new Date();
+      d.setDate(d.getDate() - 9);
+      return d.toISOString().split("T")[0];
+    })();
+
+    // Amazon returns purchaseDate in marketplace-local time (e.g. PST -07:00 for US).
+    // Pad the UTC fetch range by ±1 day so we capture all orders whose local sale_date
+    // falls within the target window, then discard orders whose local date is outside.
+    const fetchStart = new Date(startDate + "T00:00:00Z");
+    fetchStart.setUTCDate(fetchStart.getUTCDate() - 1);
+    const fetchEnd = new Date(endDate + "T23:59:59Z");
+    fetchEnd.setUTCDate(fetchEnd.getUTCDate() + 1);
 
     const rows = await amazon.fetchOrderReport(
-      startDate.toISOString().split("T")[0] + "T00:00:00Z",
-      endDate.toISOString().split("T")[0] + "T23:59:59Z"
+      fetchStart.toISOString().replace(/\.\d+Z$/, "Z"),
+      fetchEnd.toISOString().replace(/\.\d+Z$/, "Z")
     );
+
+    // Wipe existing rows in the target sale_date window so re-syncing is idempotent —
+    // necessary because Amazon orders DO change after the fact (Pending → Shipped → Cancelled),
+    // and partial overwrites from a sliding window were the source of historical undercounts.
+    await supabase.from("amazon_sales_snapshots")
+      .delete()
+      .gte("sale_date", startDate)
+      .lte("sale_date", endDate);
 
     // Group by ASIN + sale_date
     const grouped = new Map<
@@ -695,6 +723,9 @@ export async function syncAmazonSalesSnapshot(): Promise<SyncResult> {
     for (const row of rows) {
       const saleDate = row.purchaseDate.split("T")[0];
       if (!saleDate || !row.asin) continue;
+      // Drop orders whose marketplace-local sale_date falls outside the target window
+      // (they're inside our padded UTC fetch range but belong to a different day)
+      if (saleDate < startDate || saleDate > endDate) continue;
 
       const key = `${row.asin}::${saleDate}`;
       if (!grouped.has(key)) {
@@ -736,29 +767,26 @@ export async function syncAmazonSalesSnapshot(): Promise<SyncResult> {
       }
     }
 
-    // Upsert snapshots
+    // Insert fresh — we wiped the target sale_date range above.
     let count = 0;
     for (const g of Array.from(grouped.values())) {
-      await supabase.from("amazon_sales_snapshots").upsert(
-        {
-          asin: g.asin,
-          seller_sku: g.seller_sku,
-          product_name: g.product_name,
-          sale_date: g.sale_date,
-          units_shipped: g.shipped.units,
-          revenue: g.shipped.revenue,
-          units_pending: g.pending,
-          units_cancelled: g.cancelled,
-          recurring_units: g.recurring.units,
-          recurring_revenue: g.recurring.revenue,
-          sns_checkout_units: g.sns_checkout.units,
-          sns_checkout_revenue: g.sns_checkout.revenue,
-          one_time_units: g.one_time.units,
-          one_time_revenue: g.one_time.revenue,
-          snapshot_taken_at: new Date().toISOString(),
-        },
-        { onConflict: "asin,sale_date" }
-      );
+      await supabase.from("amazon_sales_snapshots").insert({
+        asin: g.asin,
+        seller_sku: g.seller_sku,
+        product_name: g.product_name,
+        sale_date: g.sale_date,
+        units_shipped: g.shipped.units,
+        revenue: g.shipped.revenue,
+        units_pending: g.pending,
+        units_cancelled: g.cancelled,
+        recurring_units: g.recurring.units,
+        recurring_revenue: g.recurring.revenue,
+        sns_checkout_units: g.sns_checkout.units,
+        sns_checkout_revenue: g.sns_checkout.revenue,
+        one_time_units: g.one_time.units,
+        one_time_revenue: g.one_time.revenue,
+        snapshot_taken_at: new Date().toISOString(),
+      });
       count++;
     }
 
