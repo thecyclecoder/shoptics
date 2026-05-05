@@ -62,6 +62,14 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "month (YYYY-MM) required" }, { status: 400 });
   }
 
+  // Forward both cookie (for UI sessions) and authorization (for CRON_SECRET) to
+  // internal API calls so they pass middleware auth in either invocation mode.
+  const forwardAuth: Record<string, string> = {};
+  const cookie = request.headers.get("cookie");
+  const authz = request.headers.get("authorization");
+  if (cookie) forwardAuth.cookie = cookie;
+  if (authz) forwardAuth.authorization = authz;
+
   // Check if after 1st of next month (or debug mode)
   const [year, mon] = month.split("-").map(Number);
   const nextMonth = new Date(year, mon, 1); // 1st of month AFTER closing month
@@ -139,7 +147,7 @@ export async function POST(request: NextRequest) {
       // and sales-since-last-close, which drifts as channel inventory changes (kitting,
       // FBA replenishment, May sales etc) between period end and the closing run date.
       const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit?month=${month}`, {
-        headers: { cookie: request.headers.get("cookie") || "" },
+        headers: forwardAuth,
         cache: "no-store",
       });
       const auditData = await auditRes.json();
@@ -229,7 +237,7 @@ export async function POST(request: NextRequest) {
     try {
       const receiptRes = await fetch(`${request.nextUrl.origin}/api/qb/sales-receipt`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", cookie: request.headers.get("cookie") || "" },
+        headers: { "Content-Type": "application/json", ...forwardAuth },
         body: JSON.stringify({ channel: "amazon", month, debug }),
       });
       const receiptData = await receiptRes.json();
@@ -254,7 +262,7 @@ export async function POST(request: NextRequest) {
     try {
       const receiptRes = await fetch(`${request.nextUrl.origin}/api/qb/sales-receipt`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", cookie: request.headers.get("cookie") || "" },
+        headers: { "Content-Type": "application/json", ...forwardAuth },
         body: JSON.stringify({ channel: "shopify", month, debug }),
       });
       const receiptData = await receiptRes.json();
@@ -311,7 +319,7 @@ export async function POST(request: NextRequest) {
     // the amount of channel inventory consumed since period end.
     try {
       const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit?month=${month}`, {
-        headers: { cookie: request.headers.get("cookie") || "" },
+        headers: forwardAuth,
         cache: "no-store",
       });
       const auditData = await auditRes.json();

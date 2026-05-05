@@ -44,10 +44,11 @@ export async function updateSession(request: NextRequest) {
     pathname.startsWith("/api/amazon/") ||
     pathname.startsWith("/api/qb/sync-processors") ||
     pathname.startsWith("/api/qb/journal-entry") ||
-    // Allow month-end-closing when called with a valid CRON_SECRET bearer token,
-    // so it can be triggered by automation / scripts. UI calls (no header) still
-    // fall through to the admin-only auth path below.
-    (pathname.startsWith("/api/qb/month-end-closing")
+    // Allow month-end-closing + sales-receipt when called with a valid CRON_SECRET
+    // bearer token. UI calls (no header) still fall through to the admin-only path.
+    // sales-receipt needs the bypass too because month-end-closing makes internal
+    // HTTP calls to it and needs to forward its own auth.
+    ((pathname.startsWith("/api/qb/month-end-closing") || pathname.startsWith("/api/qb/sales-receipt"))
       && request.headers.get("authorization") === `Bearer ${process.env.CRON_SECRET}`) ||
     pathname.startsWith("/api/overview/") ||
     pathname === "/api/inventory-audit" ||
