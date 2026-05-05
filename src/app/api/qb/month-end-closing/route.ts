@@ -126,14 +126,19 @@ export async function POST(request: NextRequest) {
     }
 
     // ============ STEP 2: Inventory Adjustment ============
-    
+
     try {
       // Get shrinkage account from configurable mappings
       const shrinkageMapping = await getQBMapping("shrinkage_account");
       const shrinkageAcctId = shrinkageMapping.qb_id;
 
-      // Get inventory audit data to find variances
-      const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit`, {
+      // Get inventory audit data scoped to the closing month so variances reflect
+      // the period being closed — uses post-prior-month-close QB snapshot as start,
+      // FBA/3PL snapshots dated end of the closing month, and sales filtered to that
+      // month only. Without the month param, the audit would use CURRENT snapshots
+      // and sales-since-last-close, which drifts as channel inventory changes (kitting,
+      // FBA replenishment, May sales etc) between period end and the closing run date.
+      const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit?month=${month}`, {
         headers: { cookie: request.headers.get("cookie") || "" },
         cache: "no-store",
       });
@@ -301,8 +306,11 @@ export async function POST(request: NextRequest) {
     // Compare post-closing QB inventory directly against channel inventory (FBA + 3PL + Manual).
     // Do NOT re-run the full inventory-audit formula (QB Start - Sales = Expected) because
     // after closing, QB already reflects the adjustment + sales receipts — that would double-count.
+    // Use the month-scoped audit so we compare against the same FBA/3PL snapshots (dated period
+    // end) that drove the adjustment in Step 2 — otherwise the variance check false-alarms by
+    // the amount of channel inventory consumed since period end.
     try {
-      const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit`, {
+      const auditRes = await fetch(`${request.nextUrl.origin}/api/inventory-audit?month=${month}`, {
         headers: { cookie: request.headers.get("cookie") || "" },
         cache: "no-store",
       });
