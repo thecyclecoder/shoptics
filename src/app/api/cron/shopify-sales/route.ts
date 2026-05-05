@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { syncShopifySalesSnapshot } from "@/lib/sync-engine";
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function GET(request: NextRequest) {
   const authHeader = request.headers.get("authorization");
@@ -9,8 +9,13 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // Backfill mode: pass ?start=YYYY-MM-DD&end=YYYY-MM-DD to wipe and re-sync a range.
+  // Default (no params) = cron mode = pull yesterday only, skip if already present.
+  const start = request.nextUrl.searchParams.get("start") || undefined;
+  const end = request.nextUrl.searchParams.get("end") || undefined;
+
   try {
-    const result = await syncShopifySalesSnapshot();
+    const result = await syncShopifySalesSnapshot(start, end);
     return NextResponse.json(result);
   } catch (err) {
     const message = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);

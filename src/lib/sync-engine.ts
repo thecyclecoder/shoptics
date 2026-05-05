@@ -780,22 +780,49 @@ export async function syncShopifySalesSnapshot(
   try {
     const supabase = createServiceClient();
 
-    // Default: last 3 days (Shopify orders settle faster than Amazon)
+    // Sale-date window in store-local dates.
+    // Default cron mode: yesterday only — Shopify orders are final once captured,
+    // so we never re-pull past dates. Backfill mode: pass explicit start+end.
     const endDate = endDateStr || (() => {
       const d = new Date();
       d.setDate(d.getDate() - 1);
       return d.toISOString().split("T")[0];
     })();
-    const startDate = startDateStr || (() => {
-      const d = new Date();
-      d.setDate(d.getDate() - 4);
-      return d.toISOString().split("T")[0];
-    })();
+    const startDate = startDateStr || endDate;
+    const isBackfill = !!startDateStr;
+
+    // Shopify returns created_at in store-local time; we bucket by that local date.
+    // The API filter is in UTC. Pad the UTC fetch range by 1 day on each side to
+    // safely cover any timezone offset, then discard orders whose local date falls
+    // outside the target sale-date window.
+    const fetchStart = new Date(startDate + "T00:00:00Z");
+    fetchStart.setUTCDate(fetchStart.getUTCDate() - 1);
+    const fetchEnd = new Date(endDate + "T23:59:59Z");
+    fetchEnd.setUTCDate(fetchEnd.getUTCDate() + 1);
 
     const orders = await shopify.fetchOrdersForSales(
-      startDate + "T00:00:00Z",
-      endDate + "T23:59:59Z"
+      fetchStart.toISOString().replace(/\.\d+Z$/, "Z"),
+      fetchEnd.toISOString().replace(/\.\d+Z$/, "Z")
     );
+
+    // Backfill: wipe existing rows in the target range so re-running is idempotent.
+    // Cron mode (single day): skip if rows already exist for that date.
+    if (isBackfill) {
+      await supabase.from("shopify_sales_snapshots")
+        .delete()
+        .gte("sale_date", startDate)
+        .lte("sale_date", endDate);
+    } else {
+      const { data: existing } = await supabase
+        .from("shopify_sales_snapshots")
+        .select("id")
+        .eq("sale_date", startDate)
+        .limit(1);
+      if (existing && existing.length > 0) {
+        await finishLog(logId, "success", 0);
+        return { job: "syncShopifySalesSnapshot", status: "success", records: 0 };
+      }
+    }
 
     // Group by variant_id + sale_date
     const grouped = new Map<
@@ -819,6 +846,10 @@ export async function syncShopifySalesSnapshot(
       if (order.financial_status === "voided") continue;
 
       const saleDate = order.created_at.split("T")[0];
+      // Drop orders whose store-local sale_date falls outside the target window
+      // (they're inside our padded UTC fetch range but belong to a different day)
+      if (saleDate < startDate || saleDate > endDate) continue;
+
       const isRecurring = order.source_name === "subscription_contract_checkout_one";
       const isFirstSub = !isRecurring && (order.tags || "").includes("First Subscription");
 
@@ -866,29 +897,27 @@ export async function syncShopifySalesSnapshot(
       }
     }
 
-    // Upsert
+    // Insert fresh rows (we either wiped the range above for backfill,
+    // or skipped early for cron mode if rows already existed).
     let count = 0;
     for (const g of Array.from(grouped.values())) {
-      await supabase.from("shopify_sales_snapshots").upsert(
-        {
-          variant_id: g.variant_id,
-          sku: g.sku,
-          product_name: g.product_name,
-          sale_date: g.sale_date,
-          units_sold: g.units,
-          revenue: g.revenue,
-          recurring_units: g.recurring.units,
-          recurring_revenue: g.recurring.revenue,
-          first_sub_units: g.first_sub.units,
-          first_sub_revenue: g.first_sub.revenue,
-          one_time_units: g.one_time.units,
-          one_time_revenue: g.one_time.revenue,
-          refund_units: g.refund_units,
-          refund_amount: g.refund_amount,
-          snapshot_taken_at: new Date().toISOString(),
-        },
-        { onConflict: "variant_id,sale_date" }
-      );
+      await supabase.from("shopify_sales_snapshots").insert({
+        variant_id: g.variant_id,
+        sku: g.sku,
+        product_name: g.product_name,
+        sale_date: g.sale_date,
+        units_sold: g.units,
+        revenue: g.revenue,
+        recurring_units: g.recurring.units,
+        recurring_revenue: g.recurring.revenue,
+        first_sub_units: g.first_sub.units,
+        first_sub_revenue: g.first_sub.revenue,
+        one_time_units: g.one_time.units,
+        one_time_revenue: g.one_time.revenue,
+        refund_units: g.refund_units,
+        refund_amount: g.refund_amount,
+        snapshot_taken_at: new Date().toISOString(),
+      });
       count++;
     }
 

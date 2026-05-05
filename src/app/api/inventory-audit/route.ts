@@ -1,10 +1,28 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const supabase = createServiceClient();
+
+  // Optional ?month=YYYY-MM puts the audit into "monthly view" mode:
+  // - QB start = post-close snapshot of the prior month (= start of target month)
+  // - FBA/3PL = snapshots dated on/closest to the last day of target month
+  // - Sales = filtered to that month only
+  // - Manual inventory = current (no historical snapshots; UI should warn)
+  const monthParam = request.nextUrl.searchParams.get("month");
+  let periodStart: string | null = null;
+  let periodEnd: string | null = null;
+  let priorMonth: string | null = null;
+  if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
+    const [y, m] = monthParam.split("-").map(Number);
+    periodStart = `${monthParam}-01`;
+    periodEnd = new Date(y, m, 0).toISOString().split("T")[0];
+    const pm = m === 1 ? 12 : m - 1;
+    const py = m === 1 ? y - 1 : y;
+    priorMonth = `${py}-${String(pm).padStart(2, "0")}`;
+  }
 
   // 1. Products
   const { data: products } = await supabase
@@ -23,39 +41,55 @@ export async function GET() {
     .select("external_id, source, product_id, unit_multiplier")
     .eq("active", true);
 
-  // 3. Latest FBA inventory
-  const { data: latestFbaDate } = await supabase
-    .from("amazon_inventory_snapshots")
-    .select("snapshot_date")
-    .order("snapshot_date", { ascending: false })
-    .limit(1)
-    .single();
+  // 3. FBA inventory — latest snapshot, OR snapshot on/closest-before periodEnd in monthly view
+  const { data: fbaDateRow } = periodEnd
+    ? await supabase
+        .from("amazon_inventory_snapshots")
+        .select("snapshot_date")
+        .lte("snapshot_date", periodEnd)
+        .order("snapshot_date", { ascending: false })
+        .limit(1)
+        .single()
+    : await supabase
+        .from("amazon_inventory_snapshots")
+        .select("snapshot_date")
+        .order("snapshot_date", { ascending: false })
+        .limit(1)
+        .single();
 
   const fbaByAsin = new Map<string, { fulfillable: number; transit: number }>();
-  if (latestFbaDate) {
+  if (fbaDateRow) {
     const { data: fbaSnaps } = await supabase
       .from("amazon_inventory_snapshots")
       .select("asin, quantity_fulfillable, quantity_transit")
-      .eq("snapshot_date", latestFbaDate.snapshot_date);
+      .eq("snapshot_date", fbaDateRow.snapshot_date);
     for (const s of fbaSnaps || []) {
       fbaByAsin.set(s.asin, { fulfillable: s.quantity_fulfillable, transit: s.quantity_transit || 0 });
     }
   }
 
-  // 4. Latest 3PL inventory
-  const { data: latestTplDate } = await supabase
-    .from("tpl_inventory_snapshots")
-    .select("snapshot_date")
-    .order("snapshot_date", { ascending: false })
-    .limit(1)
-    .single();
+  // 4. 3PL inventory — same pattern as FBA
+  const { data: tplDateRow } = periodEnd
+    ? await supabase
+        .from("tpl_inventory_snapshots")
+        .select("snapshot_date")
+        .lte("snapshot_date", periodEnd)
+        .order("snapshot_date", { ascending: false })
+        .limit(1)
+        .single()
+    : await supabase
+        .from("tpl_inventory_snapshots")
+        .select("snapshot_date")
+        .order("snapshot_date", { ascending: false })
+        .limit(1)
+        .single();
 
   const tplBySku = new Map<string, number>();
-  if (latestTplDate) {
+  if (tplDateRow) {
     const { data: tplSnaps } = await supabase
       .from("tpl_inventory_snapshots")
       .select("sku, quantity_available")
-      .eq("snapshot_date", latestTplDate.snapshot_date);
+      .eq("snapshot_date", tplDateRow.snapshot_date);
     for (const s of tplSnaps || []) {
       tplBySku.set(s.sku, s.quantity_available);
     }
@@ -83,52 +117,79 @@ export async function GET() {
     manualByProduct.set(m.product_id, list);
   }
 
-  // 6. QB inventory snapshots (latest per product = end of prev month baseline)
-  const { data: qbSnapshots } = await supabase
-    .from("inventory_snapshots")
-    .select("product_id, quantity, snapshot_at")
-    .eq("source", "quickbooks")
-    .order("snapshot_at", { ascending: false });
-
+  // 6. QB inventory snapshots
+  // Live mode: latest snapshot per product
+  // Monthly view: post-close snapshot of the prior month (= QB at start of target month)
   const qbInventory = new Map<string, number>();
-  for (const snap of qbSnapshots || []) {
-    if (!qbInventory.has(snap.product_id)) {
-      qbInventory.set(snap.product_id, snap.quantity);
+  let qbSnapshotDate: string | null = null;
+  if (priorMonth) {
+    // Pull all QB snapshots, then filter for the post-close of prior month in JS
+    // (Postgrest filtering on JSON keys is awkward; in-memory is simpler and rows are small)
+    const { data: qbSnapshots } = await supabase
+      .from("inventory_snapshots")
+      .select("product_id, quantity, snapshot_at, raw_payload")
+      .eq("source", "quickbooks")
+      .order("snapshot_at", { ascending: true });
+    for (const snap of qbSnapshots || []) {
+      const p = (snap.raw_payload || {}) as { snapshot_type?: string; month?: string };
+      if (p.snapshot_type === "month_end_post" && p.month === priorMonth) {
+        qbInventory.set(snap.product_id, snap.quantity);
+        if (!qbSnapshotDate) qbSnapshotDate = snap.snapshot_at?.split("T")[0] || null;
+      }
+    }
+  } else {
+    const { data: qbSnapshots } = await supabase
+      .from("inventory_snapshots")
+      .select("product_id, quantity, snapshot_at")
+      .eq("source", "quickbooks")
+      .order("snapshot_at", { ascending: false });
+    for (const snap of qbSnapshots || []) {
+      if (!qbInventory.has(snap.product_id)) {
+        qbInventory.set(snap.product_id, snap.quantity);
+      }
+    }
+    qbSnapshotDate = qbSnapshots?.[0]?.snapshot_at?.split("T")[0] || null;
+  }
+
+  // 7. Sales window
+  // Live mode: since last close
+  // Monthly view: filtered to that month only
+  let salesSince: string;
+  let salesUntil: string | null = null;
+  if (periodStart && periodEnd) {
+    salesSince = periodStart;
+    salesUntil = periodEnd;
+  } else {
+    const { data: lastClosing } = await supabase
+      .from("month_end_closings")
+      .select("closing_month, status")
+      .in("status", ["completed", "completed_with_errors"])
+      .order("closing_month", { ascending: false })
+      .limit(1)
+      .single();
+    if (lastClosing) {
+      const [y, m] = lastClosing.closing_month.split("-").map(Number);
+      const nextMonth = m === 12 ? 1 : m + 1;
+      const nextYear = m === 12 ? y + 1 : y;
+      salesSince = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+    } else {
+      salesSince = "2026-03-01";
     }
   }
-  const qbSnapshotDate = qbSnapshots?.[0]?.snapshot_at?.split("T")[0] || null;
 
-  // 7. Sales since last close (for burn calculation)
-  // Find the most recent completed month-end closing
-  const { data: lastClosing } = await supabase
-    .from("month_end_closings")
-    .select("closing_month, status")
-    .in("status", ["completed", "completed_with_errors"])
-    .order("closing_month", { ascending: false })
-    .limit(1)
-    .single();
-
-  let salesSince: string;
-  if (lastClosing) {
-    // Sales since the 1st of the month AFTER the last closed month
-    const [y, m] = lastClosing.closing_month.split("-").map(Number);
-    const nextMonth = m === 12 ? 1 : m + 1;
-    const nextYear = m === 12 ? y + 1 : y;
-    salesSince = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
-  } else {
-    // No closing yet — March 2026 is the first close, so baseline is March 1
-    salesSince = "2026-03-01";
-  }
-
-  const { data: amazonSales } = await supabase
+  let amazonSalesQuery = supabase
     .from("amazon_sales_snapshots")
     .select("asin, units_shipped")
     .gte("sale_date", salesSince);
+  if (salesUntil) amazonSalesQuery = amazonSalesQuery.lte("sale_date", salesUntil);
+  const { data: amazonSales } = await amazonSalesQuery;
 
-  const { data: shopifySales } = await supabase
+  let shopifySalesQuery = supabase
     .from("shopify_sales_snapshots")
     .select("variant_id, units_sold")
     .gte("sale_date", salesSince);
+  if (salesUntil) shopifySalesQuery = shopifySalesQuery.lte("sale_date", salesUntil);
+  const { data: shopifySales } = await shopifySalesQuery;
 
   const amzSalesByAsin = new Map<string, number>();
   for (const r of amazonSales || []) {
@@ -356,12 +417,18 @@ export async function GET() {
     standalone_finished_goods: standaloneItems.filter((i) => i.total > 0 || i.qb_starting > 0),
     unattached_components: unattachedItems.filter((i) => i.total > 0),
     meta: {
+      mode: monthParam ? "monthly" : "live",
+      month: monthParam,
+      period_start: periodStart,
+      period_end: periodEnd,
       qb_snapshot_date: qbSnapshotDate,
+      qb_snapshot_basis: priorMonth ? `month_end_post snapshot for ${priorMonth}` : "latest",
       sales_since: salesSince,
-      last_closing_month: lastClosing?.closing_month || null,
-      fba_snapshot_date: latestFbaDate?.snapshot_date || null,
-      tpl_snapshot_date: latestTplDate?.snapshot_date || null,
+      sales_until: salesUntil,
+      fba_snapshot_date: fbaDateRow?.snapshot_date || null,
+      tpl_snapshot_date: tplDateRow?.snapshot_date || null,
       manual_entries_count: manualEntries.length,
+      manual_caveat: monthParam ? "manual_inventory has no historical snapshots — values shown are CURRENT" : null,
     },
   });
   response.headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
