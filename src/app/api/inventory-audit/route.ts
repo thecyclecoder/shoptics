@@ -241,12 +241,16 @@ export async function GET(request: NextRequest) {
     const pm = mappingsByProduct.get(productId) || [];
     let fba = 0, fbaTransit = 0, tpl = 0;
     for (const m of pm) {
+      // Floor each physical-channel value at 0: a negative snapshot quantity (oversold or a
+      // glitched sync) is not real inventory and must not subtract from sibling stock. Manual
+      // adjustments ARE intentional (e.g. misprint write-downs) and may legitimately be
+      // negative — they are kept as-is and combined into the total below.
       if (m.source === "amazon") {
         const snap = fbaByAsin.get(m.external_id);
-        fba += (snap?.fulfillable || 0) * m.multiplier;
-        fbaTransit += (snap?.transit || 0) * m.multiplier;
+        fba += Math.max(0, snap?.fulfillable || 0) * m.multiplier;
+        fbaTransit += Math.max(0, snap?.transit || 0) * m.multiplier;
       } else if (m.source === "3pl") {
-        tpl += (tplBySku.get(m.external_id) || 0) * m.multiplier;
+        tpl += Math.max(0, tplBySku.get(m.external_id) || 0) * m.multiplier;
       }
     }
     const manualList = manualByProduct.get(productId) || [];
@@ -288,7 +292,8 @@ export async function GET(request: NextRequest) {
       totalTpl += parentInv.tpl * quantity;
       totalManual += parentInv.manual * quantity;
     }
-    const total = totalFba + totalTransit + totalTpl + totalManual;
+    // Floor the implied total at 0 — a component's implied stock can never be negative.
+    const total = Math.max(0, totalFba + totalTransit + totalTpl + totalManual);
     componentTotalImplied.set(compId, { fba: totalFba, fba_transit: totalTransit, tpl: totalTpl, manual: totalManual, total });
   }
 
@@ -354,7 +359,10 @@ export async function GET(request: NextRequest) {
       const totalImplied = componentTotalImplied.get(comp.id) || { fba: 0, fba_transit: 0, tpl: 0, manual: 0, total: 0 };
 
       const compInv = getChannelInventory(comp.id);
-      const actualTotal = totalImplied.total + compInv.total;
+      // Combine implied-from-parents with this component's own stock (manual offsets included)
+      // BEFORE flooring, so an intentional negative manual write-down still reduces the actual,
+      // but the final actual can never read negative.
+      const actualTotal = Math.max(0, totalImplied.total + compInv.total);
       const compVariance = actualTotal - compExpected;
 
       return {
@@ -382,10 +390,10 @@ export async function GET(request: NextRequest) {
 
     return {
       product_id: bundle.id, name: bundle.name, sku: bundle.sku, image_url: bundle.image_url,
-      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, finished_good_units: inv.total,
+      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, finished_good_units: Math.max(0, inv.total),
       qb_starting: qbStart, amazon_sold: burn.amazon_sold, shopify_sold: burn.shopify_sold,
       total_sold: burn.total_sold, expected_remaining: expected,
-      variance: inv.total - expected,
+      variance: Math.max(0, inv.total) - expected,
       bom_items: bomItems,
     };
   });
@@ -397,10 +405,10 @@ export async function GET(request: NextRequest) {
     const expected = qbStart - burn.total_sold;
     return {
       product_id: p.id, name: p.name, sku: p.sku, image_url: p.image_url,
-      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, total: inv.total,
+      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, total: Math.max(0, inv.total),
       qb_starting: qbStart, amazon_sold: burn.amazon_sold, shopify_sold: burn.shopify_sold,
       total_sold: burn.total_sold, expected_remaining: expected,
-      variance: inv.total - expected,
+      variance: Math.max(0, inv.total) - expected,
     };
   });
 
@@ -408,7 +416,7 @@ export async function GET(request: NextRequest) {
     const inv = getChannelInventory(p.id);
     return {
       product_id: p.id, name: p.name, sku: p.sku, image_url: p.image_url,
-      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, total: inv.total,
+      fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, total: Math.max(0, inv.total),
     };
   });
 
