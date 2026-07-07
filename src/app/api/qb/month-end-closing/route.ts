@@ -425,7 +425,7 @@ export async function POST(request: NextRequest) {
           shopify_journal_entry_doc: jeData.doc_number,
         }).eq("id", closingId);
         steps.push({
-          step: 7,
+          step: 8,
           name: "Shopify Journal Entry",
           status: "success",
           message: `JE #${jeData.doc_number} — ${jeData.line_count} lines, ${jeData.updated ? "updated" : "created"}`,
