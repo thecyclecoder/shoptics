@@ -112,6 +112,48 @@ async function baseUrl(): Promise<string> {
     : "https://sandbox-quickbooks.api.intuit.com";
 }
 
+/**
+ * Sum inventory quantity RECEIVED via purchases (Bill / ItemReceipt / Purchase) with
+ * TxnDate in [startDate, endDate], keyed by QB item id. Feeds the inventory audit's
+ * receipts term so a mid-month PO (e.g. a carton purchase) raises "expected" instead of
+ * reading as a positive variance and triggering a phantom adjustment. Fails soft: an
+ * unsupported/empty entity is skipped, so a QB hiccup degrades to received = 0.
+ */
+export async function fetchInventoryReceiptsByItem(
+  startDate: string,
+  endDate: string
+): Promise<Map<string, number>> {
+  const { token, realmId } = await getRealmAndToken();
+  const base = await baseUrl();
+  const received = new Map<string, number>();
+
+  for (const entity of ["Bill", "ItemReceipt", "Purchase"]) {
+    const query = `SELECT * FROM ${entity} WHERE TxnDate >= '${startDate}' AND TxnDate <= '${endDate}' MAXRESULTS 1000`;
+    let res: Response;
+    try {
+      res = await fetch(
+        `${base}/v3/company/${realmId}/query?query=${encodeURIComponent(query)}`,
+        { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
+      );
+    } catch {
+      continue;
+    }
+    if (!res.ok) continue;
+    const data = await res.json();
+    const rows = data.QueryResponse?.[entity] || [];
+    for (const txn of rows) {
+      for (const line of txn.Line || []) {
+        const d = line.ItemBasedExpenseLineDetail;
+        if (!d?.ItemRef?.value || d.Qty === undefined) continue;
+        const qty = Number(d.Qty) || 0;
+        if (qty === 0) continue;
+        received.set(d.ItemRef.value, (received.get(d.ItemRef.value) || 0) + qty);
+      }
+    }
+  }
+  return received;
+}
+
 export async function updateItem(
   itemId: string,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

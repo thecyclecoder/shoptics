@@ -22,6 +22,10 @@
       "schedule": "0 7 * * *"
     },
     {
+      "path": "/api/cron/internal-sales",
+      "schedule": "15 7 * * *"
+    },
+    {
       "path": "/api/cron/processor-snapshot",
       "schedule": "0 8 * * *"
     },

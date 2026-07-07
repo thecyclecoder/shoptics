@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
+import { fetchInventoryReceiptsByItem } from "@/lib/integrations/quickbooks";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +28,7 @@ export async function GET(request: NextRequest) {
   // 1. Products
   const { data: products } = await supabase
     .from("products")
-    .select("id, quickbooks_name, sku, image_url, item_type, product_category, bundle_id, bundle_quantity, unit_cost")
+    .select("id, quickbooks_id, quickbooks_name, sku, image_url, item_type, product_category, bundle_id, bundle_quantity, unit_cost")
     .eq("active", true);
 
   // 1b. BOM relationships (multi-parent support)
@@ -200,6 +201,45 @@ export async function GET(request: NextRequest) {
     shopSalesByVariant.set(r.variant_id, (shopSalesByVariant.get(r.variant_id) || 0) + r.units_sold);
   }
 
+  // Internal (shopcx) sales — native storefront/subscription/comp orders fulfilled via 3PL.
+  // Already resolved to product_id with unit_multiplier applied at sync time, so key by
+  // product_id directly (no per-mapping multiply) and fold into the burn like the other channels.
+  let internalSalesQuery = supabase
+    .from("internal_sales_snapshots")
+    .select("product_id, units")
+    .gte("sale_date", salesSince);
+  if (salesUntil) internalSalesQuery = internalSalesQuery.lte("sale_date", salesUntil);
+  const { data: internalSales } = await internalSalesQuery;
+
+  const internalSalesByProduct = new Map<string, number>();
+  for (const r of internalSales || []) {
+    if (!r.product_id) continue;
+    internalSalesByProduct.set(r.product_id, (internalSalesByProduct.get(r.product_id) || 0) + r.units);
+  }
+
+  // Receipts term (monthly mode only): inventory RECEIVED via QB purchases (Bill/ItemReceipt/
+  // Purchase) during the period. Expected = start − sold + received. Without +received, a
+  // mid-month PO (e.g. a carton purchase) reads as a positive variance and Step 2 would post a
+  // phantom adjustment ON TOP of the PO QB already holds (the historical Mixed-Berry swings).
+  // Live mode uses current QB (already reflects receipts), so this stays empty there.
+  const receivedByProduct = new Map<string, number>();
+  if (periodStart && periodEnd) {
+    try {
+      const receiptsByQbItem = await fetchInventoryReceiptsByItem(periodStart, periodEnd);
+      const qbItemToProduct = new Map<string, string>();
+      for (const p of products || []) {
+        if (p.quickbooks_id) qbItemToProduct.set(String(p.quickbooks_id), p.id);
+      }
+      for (const [qbItemId, qty] of Array.from(receiptsByQbItem)) {
+        const pid = qbItemToProduct.get(String(qbItemId));
+        if (pid) receivedByProduct.set(pid, (receivedByProduct.get(pid) || 0) + qty);
+      }
+    } catch {
+      // QB unavailable — degrade to received = 0 (same as pre-receipts-term behavior)
+    }
+  }
+  const getReceived = (productId: string) => receivedByProduct.get(productId) || 0;
+
   // Build indexes
   interface ProductInfo {
     id: string; name: string; sku: string | null; image_url: string | null;
@@ -265,20 +305,23 @@ export async function GET(request: NextRequest) {
       if (m.source === "amazon") { amzSold += (amzSalesByAsin.get(m.external_id) || 0) * m.multiplier; }
       else if (m.source === "shopify") { shopSold += (shopSalesByVariant.get(m.external_id) || 0) * m.multiplier; }
     }
-    return { amazon_sold: amzSold, shopify_sold: shopSold, total_sold: amzSold + shopSold };
+    // Internal units are keyed by product_id with the multiplier already applied at sync time.
+    const intSold = internalSalesByProduct.get(productId) || 0;
+    return { amazon_sold: amzSold, shopify_sold: shopSold, internal_sold: intSold, total_sold: amzSold + shopSold + intSold };
   }
 
   // Pre-compute total component burn across ALL parent Groups
   // For each component, sum (parent_sales × bom_qty) across all parents
-  const componentTotalBurn = new Map<string, { amazon_sold: number; shopify_sold: number; total_sold: number }>();
+  const componentTotalBurn = new Map<string, { amazon_sold: number; shopify_sold: number; internal_sold: number; total_sold: number }>();
   for (const [compId, parents] of Array.from(componentToParents)) {
-    let totalAmz = 0, totalShop = 0;
+    let totalAmz = 0, totalShop = 0, totalInt = 0;
     for (const { parent_id, quantity } of parents) {
       const parentBurn = getSalesBurn(parent_id);
       totalAmz += parentBurn.amazon_sold * quantity;
       totalShop += parentBurn.shopify_sold * quantity;
+      totalInt += parentBurn.internal_sold * quantity;
     }
-    componentTotalBurn.set(compId, { amazon_sold: totalAmz, shopify_sold: totalShop, total_sold: totalAmz + totalShop });
+    componentTotalBurn.set(compId, { amazon_sold: totalAmz, shopify_sold: totalShop, internal_sold: totalInt, total_sold: totalAmz + totalShop + totalInt });
   }
 
   // Pre-compute total implied inventory for each component across ALL parents
@@ -335,7 +378,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const expected = qbStart - burn.total_sold;
+    const expected = qbStart - burn.total_sold + getReceived(bundle.id);
 
     const bomItems = components.map(({ component_id, quantity: bomQty }) => {
       const comp = productById.get(component_id);
@@ -345,8 +388,9 @@ export async function GET(request: NextRequest) {
       const compQbStart = qbInventory.get(comp.id) || 0;
 
       // Sales burn: use TOTAL burn across ALL parent Groups (not just this parent)
-      const totalBurn = componentTotalBurn.get(comp.id) || { amazon_sold: 0, shopify_sold: 0, total_sold: 0 };
-      const compExpected = compQbStart - totalBurn.total_sold;
+      const totalBurn = componentTotalBurn.get(comp.id) || { amazon_sold: 0, shopify_sold: 0, internal_sold: 0, total_sold: 0 };
+      const compReceived = getReceived(comp.id);
+      const compExpected = compQbStart - totalBurn.total_sold + compReceived;
 
       // Implied inventory from THIS parent only (for display)
       const impliedFba = inv.fba * bomQty;
@@ -371,7 +415,9 @@ export async function GET(request: NextRequest) {
         qb_starting: compQbStart,
         amazon_sold: totalBurn.amazon_sold,
         shopify_sold: totalBurn.shopify_sold,
+        internal_sold: totalBurn.internal_sold,
         total_sold: totalBurn.total_sold,
+        received: compReceived,
         expected_remaining: compExpected,
         implied_fba: impliedFba,
         implied_fba_transit: impliedFbaTransit,
@@ -392,6 +438,7 @@ export async function GET(request: NextRequest) {
       product_id: bundle.id, name: bundle.name, sku: bundle.sku, image_url: bundle.image_url,
       fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, finished_good_units: Math.max(0, inv.total),
       qb_starting: qbStart, amazon_sold: burn.amazon_sold, shopify_sold: burn.shopify_sold,
+      internal_sold: burn.internal_sold, received: getReceived(bundle.id),
       total_sold: burn.total_sold, expected_remaining: expected,
       variance: Math.max(0, inv.total) - expected,
       bom_items: bomItems,
@@ -402,11 +449,13 @@ export async function GET(request: NextRequest) {
     const inv = getChannelInventory(p.id);
     const burn = getSalesBurn(p.id);
     const qbStart = qbInventory.get(p.id) || 0;
-    const expected = qbStart - burn.total_sold;
+    const received = getReceived(p.id);
+    const expected = qbStart - burn.total_sold + received;
     return {
       product_id: p.id, name: p.name, sku: p.sku, image_url: p.image_url,
       fba: inv.fba, fba_transit: inv.fba_transit, tpl: inv.tpl, manual: inv.manual, total: Math.max(0, inv.total),
       qb_starting: qbStart, amazon_sold: burn.amazon_sold, shopify_sold: burn.shopify_sold,
+      internal_sold: burn.internal_sold, received,
       total_sold: burn.total_sold, expected_remaining: expected,
       variance: Math.max(0, inv.total) - expected,
     };

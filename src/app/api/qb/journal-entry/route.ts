@@ -332,6 +332,46 @@ async function buildJournalEntryData(month: string, overrides?: { braintree_fees
     }
   }
 
+  // === INTERNAL (shopcx) ORDERS ===
+  // Native storefront/subscription/comp orders — not in Shopify, so aggregate them separately and
+  // emit a dedicated, self-balancing block below. Self-balancing because per order,
+  // order_total = subtotal − discount + tax + shipping, so (revenue+shipping+tax credits) ==
+  // (discount + gross-to-clearing debits). Fees/refunds/chargebacks are NOT added — they already
+  // live in the Braintree processor summary (same merchant account). Amounts are stored in cents.
+  const internalRevenueByAccount = new Map<string, { id: string; name: string; amount: number }>();
+  let internalUnmappedRevenue = 0;
+  let internalShipping = 0, internalTax = 0, internalDiscount = 0, internalGross = 0;
+  let internalOrderCount = 0;
+  {
+    const { data: internalRows } = await supabase
+      .from("internal_sales_snapshots")
+      .select("product_id, gross_cents, order_total_cents, tax_cents, discount_cents, shipping_cents, line_index")
+      .gte("sale_date", `${month}-01`)
+      .lte("sale_date", `${month}-${String(lastDay).padStart(2, "0")}`);
+    for (const r of internalRows || []) {
+      const gross = Number(r.gross_cents || 0) / 100;
+      if (gross > 0) {
+        const product = r.product_id ? productLookup.get(r.product_id) : null;
+        if (product?.rev_acct_id && product?.rev_acct_name) {
+          const ex = internalRevenueByAccount.get(product.rev_acct_id) || { id: product.rev_acct_id, name: product.rev_acct_name, amount: 0 };
+          ex.amount += gross;
+          internalRevenueByAccount.set(product.rev_acct_id, ex);
+        } else {
+          internalUnmappedRevenue += gross;
+        }
+      }
+      // order-level fields live only on line_index 0 (0 elsewhere)
+      if (r.line_index === 0) {
+        internalOrderCount++;
+        internalTax += Number(r.tax_cents || 0) / 100;
+        internalDiscount += Number(r.discount_cents || 0) / 100;
+        internalShipping += Number(r.shipping_cents || 0) / 100;
+        internalGross += Number(r.order_total_cents || 0) / 100;
+      }
+    }
+    if (internalUnmappedRevenue > 0) warnings.push(`$${round2(internalUnmappedRevenue).toFixed(2)} internal revenue had no product revenue account`);
+  }
+
   // 3. Get QB account mappings
   const mappingKeys = [
     "discounts_account", "sales_tax_payable", "shipping_income",
@@ -340,6 +380,7 @@ async function buildJournalEntryData(month: string, overrides?: { braintree_fees
     "paypal_clearing", "paypal_txn_fees",
     "braintree_clearing", "braintree_txn_fees",
     "walmart_clearing", "gift_card_liability", "shopify_other_adjustments",
+    "internal_deposit_account",
   ];
   const qbMappings = await getQBMappings(mappingKeys);
 
@@ -511,6 +552,28 @@ async function buildJournalEntryData(month: string, overrides?: { braintree_fees
     });
   }
 
+  // === INTERNAL (shopcx) LINES — dedicated, self-balancing block ===
+  for (const [, acct] of Array.from(internalRevenueByAccount)) {
+    if (acct.amount > 0) {
+      lines.push({ postingType: "Credit", accountId: acct.id, accountName: acct.name, amount: round2(acct.amount), description: `${acct.name} - Internal - ${month}` });
+    }
+  }
+  if (internalShipping > 0) {
+    lines.push({ postingType: "Credit", accountId: qbMappings.shipping_income.qb_id, accountName: qbMappings.shipping_income.qb_name, amount: round2(internalShipping), description: `Shipping Income - Internal - ${month}` });
+  }
+  if (internalTax > 0) {
+    lines.push({ postingType: "Credit", accountId: qbMappings.sales_tax_payable.qb_id, accountName: qbMappings.sales_tax_payable.qb_name, amount: round2(internalTax), description: `Sales Tax Collected - Internal - ${month}` });
+  }
+  if (internalDiscount > 0) {
+    lines.push({ postingType: "Debit", accountId: qbMappings.discounts_account.qb_id, accountName: qbMappings.discounts_account.qb_name, amount: round2(internalDiscount), description: `Discounts & Coupons - Internal - ${month}` });
+  }
+  // Internal gross (customer charges) → DEBIT the configured internal deposit account (Braintree clearing).
+  if (round2(internalGross) > 0 && qbMappings.internal_deposit_account) {
+    lines.push({ postingType: "Debit", accountId: qbMappings.internal_deposit_account.qb_id, accountName: qbMappings.internal_deposit_account.qb_name, amount: round2(internalGross), description: `Internal deposits - ${month}` });
+  } else if (round2(internalGross) > 0) {
+    warnings.push("Internal orders present but no internal_deposit_account mapping — JE will not balance");
+  }
+
   // Calculate totals
   const totalDebits = lines.filter((l) => l.postingType === "Debit").reduce((s, l) => s + l.amount, 0);
   const totalCredits = lines.filter((l) => l.postingType === "Credit").reduce((s, l) => s + l.amount, 0);
@@ -574,6 +637,15 @@ async function buildJournalEntryData(month: string, overrides?: { braintree_fees
       processors,
       gross_by_processor: Object.fromEntries(Array.from(grossByProcessor)),
       order_count: allOrders.length,
+      internal: {
+        order_count: internalOrderCount,
+        revenue_accounts: Array.from(internalRevenueByAccount.values()),
+        unmapped_revenue: round2(internalUnmappedRevenue),
+        shipping: round2(internalShipping),
+        tax: round2(internalTax),
+        discounts: round2(internalDiscount),
+        gross_to_clearing: round2(internalGross),
+      },
       total_debits: round2(lines.filter((l) => l.postingType === "Debit").reduce((s, l) => s + l.amount, 0)),
       total_credits: round2(lines.filter((l) => l.postingType === "Credit").reduce((s, l) => s + l.amount, 0)),
     },

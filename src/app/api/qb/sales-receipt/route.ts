@@ -10,10 +10,10 @@ const QB_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 export async function POST(request: NextRequest) {
   try {
   const body = await request.json();
-  const { channel, month, debug } = body as { channel: "amazon" | "shopify"; month: string; debug?: boolean };
+  const { channel, month, debug } = body as { channel: "amazon" | "shopify" | "internal"; month: string; debug?: boolean };
 
-  if (!channel || !month || !["amazon", "shopify"].includes(channel)) {
-    return NextResponse.json({ error: "channel (amazon|shopify) and month (YYYY-MM) required" }, { status: 400 });
+  if (!channel || !month || !["amazon", "shopify", "internal"].includes(channel)) {
+    return NextResponse.json({ error: "channel (amazon|shopify|internal) and month (YYYY-MM) required" }, { status: 400 });
   }
 
   // Parse month to get date range and last day
@@ -60,7 +60,7 @@ export async function POST(request: NextRequest) {
       }
       salesByProduct.get(key)!.units += row.units_shipped * mapping.multiplier;
     }
-  } else {
+  } else if (channel === "shopify") {
     const { data } = await supabase
       .from("shopify_sales_snapshots")
       .select("variant_id, units_sold")
@@ -87,6 +87,23 @@ export async function POST(request: NextRequest) {
         salesByProduct.set(key, { product_id: key, units: 0 });
       }
       salesByProduct.get(key)!.units += row.units_sold * mapping.multiplier;
+    }
+  } else {
+    // internal (shopcx) — units already resolved to product_id with multiplier applied at sync time
+    const { data } = await supabase
+      .from("internal_sales_snapshots")
+      .select("product_id, units")
+      .gte("sale_date", startDate)
+      .lte("sale_date", endDate);
+
+    salesByProduct = new Map();
+    for (const row of data || []) {
+      if (!row.product_id) continue;
+      const key = row.product_id;
+      if (!salesByProduct.has(key)) {
+        salesByProduct.set(key, { product_id: key, units: 0 });
+      }
+      salesByProduct.get(key)!.units += row.units;
     }
   }
 
@@ -183,19 +200,16 @@ export async function POST(request: NextRequest) {
     }
   );
 
-  // Get configurable QB mappings
-  const mappingKeys = channel === "amazon"
-    ? ["amazon_customer", "amazon_deposit_account"]
-    : ["shopify_customer", "shopify_deposit_account"];
-  const qbMappings = await getQBMappings(mappingKeys);
-  const customerKey = channel === "amazon" ? "amazon_customer" : "shopify_customer";
-  const depositKey = channel === "amazon" ? "amazon_deposit_account" : "shopify_deposit_account";
+  // Get configurable QB mappings (keys follow the {channel}_customer / {channel}_deposit_account convention)
+  const customerKey = `${channel}_customer`;
+  const depositKey = `${channel}_deposit_account`;
+  const qbMappings = await getQBMappings([customerKey, depositKey]);
 
   // Create Sales Receipt
-  const channelCode = channel === "amazon" ? "AMZ" : "SHOP";
+  const channelCode = channel === "amazon" ? "AMZ" : channel === "shopify" ? "SHOP" : "INT";
   const [yr, mo] = month.split("-");
   const docNumber = `${channelCode}-${mo}-${yr}`;
-  const memo = channel === "amazon" ? "Amazon COGS - " : "Shopify COGS - ";
+  const memo = channel === "amazon" ? "Amazon COGS - " : channel === "shopify" ? "Shopify COGS - " : "Internal COGS - ";
 
   const receiptBody = {
     DocNumber: docNumber,

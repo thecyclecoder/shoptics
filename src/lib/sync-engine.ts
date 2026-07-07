@@ -976,3 +976,149 @@ export async function syncAll(): Promise<SyncResult[]> {
         }
   );
 }
+
+// ============================================================================
+// Internal (shopcx) sales snapshot
+// ----------------------------------------------------------------------------
+// shopcx ships native "internal" orders (storefront, native subscription renewals,
+// comps) that fulfill through Amplifier (3PL) but never touched Shopify or Amazon.
+// This pulls them from the shopcx Supabase (read-only) into internal_sales_snapshots
+// so they feed the inventory audit (units burn) + the QB internal sales receipt (COGS)
+// + the Shopify JE (revenue/tax/processor). SKUs resolve via sku_mappings source "3pl".
+// ============================================================================
+
+const SHOPCX_URL = process.env.SHOPCX_SUPABASE_URL;
+const SHOPCX_KEY = process.env.SHOPCX_SUPABASE_SERVICE_ROLE_KEY;
+const SHOPCX_WORKSPACE = process.env.SHOPCX_SUPERFOODS_WORKSPACE_ID || "fdc11e10-b89f-4989-8b73-ed6526c4d906";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function shopcxQuery(path: string): Promise<any[]> {
+  if (!SHOPCX_URL || !SHOPCX_KEY) throw new Error("SHOPCX_SUPABASE_URL / SHOPCX_SUPABASE_SERVICE_ROLE_KEY not configured");
+  const res = await fetch(`${SHOPCX_URL}/rest/v1/${path}`, {
+    headers: { apikey: SHOPCX_KEY, Authorization: `Bearer ${SHOPCX_KEY}`, Range: "0-99999" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`shopcx query failed ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
+
+export async function syncInternalSalesSnapshot(
+  startDateStr?: string,
+  endDateStr?: string
+): Promise<SyncResult> {
+  const logId = await startLog("syncInternalSalesSnapshot");
+  try {
+    const supabase = createServiceClient();
+
+    // Default cron mode: yesterday only. Backfill: explicit start+end.
+    const endDate = endDateStr || (() => {
+      const d = new Date();
+      d.setDate(d.getDate() - 1);
+      return d.toISOString().split("T")[0];
+    })();
+    const startDate = startDateStr || endDate;
+    const isBackfill = !!startDateStr;
+
+    // shopcx orders.created_at is a UTC timestamp; bucket sale_date by its date.
+    // Pad the fetch window ±1 day and discard out-of-window rows after bucketing.
+    const fetchStart = new Date(startDate + "T00:00:00Z");
+    fetchStart.setUTCDate(fetchStart.getUTCDate() - 1);
+    const fetchEnd = new Date(endDate + "T23:59:59Z");
+    fetchEnd.setUTCDate(fetchEnd.getUTCDate() + 1);
+
+    // Internal orders = shopify_order_id IS NULL, Superfoods workspace, not voided/cancelled.
+    const orders = await shopcxQuery(
+      `orders?select=id,order_number,source_name,financial_status,created_at,total_cents,line_items,payment_details,avalara_total_tax_cents,shipping_protection_amount_cents` +
+        `&shopify_order_id=is.null&workspace_id=eq.${SHOPCX_WORKSPACE}` +
+        `&created_at=gte.${fetchStart.toISOString()}&created_at=lte.${fetchEnd.toISOString()}` +
+        `&order=created_at.asc`
+    );
+
+    // 3PL SKU → product mapping (internal orders fulfill from Amplifier).
+    const { data: allMappings } = await supabase
+      .from("sku_mappings")
+      .select("external_id, product_id, unit_multiplier, active")
+      .eq("source", "3pl");
+    const mappingLookup = new Map<string, { product_id: string; multiplier: number }>();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const m of (allMappings || []).filter((m: any) => m.active)) {
+      mappingLookup.set(m.external_id, { product_id: m.product_id, multiplier: m.unit_multiplier || 1 });
+    }
+
+    // Idempotency: backfill wipes the date range; cron mode skips if the day is present.
+    if (isBackfill) {
+      await supabase.from("internal_sales_snapshots").delete().gte("sale_date", startDate).lte("sale_date", endDate);
+    } else {
+      const { data: existing } = await supabase
+        .from("internal_sales_snapshots").select("id").eq("sale_date", startDate).limit(1);
+      if (existing && existing.length > 0) {
+        await finishLog(logId, "success", 0);
+        return { job: "syncInternalSalesSnapshot", status: "success", records: 0 };
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows: any[] = [];
+    for (const order of orders) {
+      const status = String(order.financial_status || "").toLowerCase();
+      if (status === "voided" || status === "cancelled" || status === "canceled") continue;
+
+      const saleDate = String(order.created_at).split("T")[0];
+      if (saleDate < startDate || saleDate > endDate) continue;
+
+      const pd = order.payment_details || {};
+      const processor = pd.gateway || "unknown";
+      // shipping income = shipping + shipping protection
+      const shippingCents = Number(pd.shipping_cents || 0) + Number(pd.protection_cents ?? order.shipping_protection_amount_cents ?? 0);
+      const taxCents = Number(pd.tax_cents ?? order.avalara_total_tax_cents ?? 0);
+      const discountCents = Number(pd.discount_cents || 0);
+
+      const lineItems = (order.line_items || []) as Array<{ sku?: string; quantity?: number; price_cents?: number; unit_price_cents?: number; variant_id?: string }>;
+      let lineIndex = 0;
+      for (const li of lineItems) {
+        const sku = (li.sku || "").trim();
+        if (!sku) continue;
+        const mapping = mappingLookup.get(sku);
+        if (!mapping) await trackUnmappedSku(sku, "internal");
+        const unitPrice = Number(li.price_cents ?? li.unit_price_cents ?? 0);
+        const qty = Number(li.quantity || 0);
+        rows.push({
+          order_id: String(order.id),
+          order_number: order.order_number || null,
+          line_index: lineIndex,
+          sale_date: saleDate,
+          source_name: order.source_name || null,
+          financial_status: order.financial_status || null,
+          processor,
+          sku,
+          variant_id: li.variant_id || null,
+          product_id: mapping?.product_id || null,
+          units: qty * (mapping?.multiplier || 1),
+          gross_cents: Math.round(unitPrice * qty),
+          // order-level fields only on line_index 0 (0 elsewhere) to count each order once
+          order_total_cents: lineIndex === 0 ? Number(order.total_cents || 0) : 0,
+          discount_cents: lineIndex === 0 ? discountCents : 0,
+          tax_cents: lineIndex === 0 ? taxCents : 0,
+          shipping_cents: lineIndex === 0 ? shippingCents : 0,
+          raw_payload: { source_name: order.source_name, payment_details: pd },
+        });
+        lineIndex++;
+      }
+    }
+
+    let count = 0;
+    if (rows.length > 0) {
+      // upsert on (order_id, line_index) so re-runs are idempotent even in cron mode
+      const { error } = await supabase.from("internal_sales_snapshots").upsert(rows, { onConflict: "order_id,line_index" });
+      if (error) throw new Error(error.message);
+      count = rows.length;
+    }
+
+    await finishLog(logId, "success", count);
+    return { job: "syncInternalSalesSnapshot", status: "success", records: count };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await finishLog(logId, "error", 0, msg);
+    return { job: "syncInternalSalesSnapshot", status: "error", records: 0, error: msg };
+  }
+}

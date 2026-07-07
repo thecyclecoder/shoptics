@@ -282,7 +282,34 @@ export async function POST(request: NextRequest) {
       steps.push({ step: 4, name: "Shopify Sales Receipt", status: "error", message: err instanceof Error ? err.message : String(err) });
     }
 
-    // ============ STEP 5: Re-snapshot QB Inventory (Post-Closing) ============
+    // ============ STEP 5: Internal (shopcx) Sales Receipt ============
+    // Native storefront/subscription/comp orders fulfilled via 3PL — books their COGS via QB
+    // Group expansion, same pattern as Amazon/Shopify. Revenue for these is handled in the JE
+    // (Step 8); this step only reduces inventory / records COGS.
+    try {
+      const receiptRes = await fetch(`${request.nextUrl.origin}/api/qb/sales-receipt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...forwardAuth },
+        body: JSON.stringify({ channel: "internal", month, debug }),
+      });
+      const receiptData = await receiptRes.json();
+
+      if (receiptRes.ok && receiptData.success) {
+        await supabase.from("month_end_closings").update({
+          internal_receipt_id: receiptData.receipt_id,
+          internal_receipt_doc: receiptData.doc_number,
+        }).eq("id", closingId);
+        steps.push({ step: 5, name: "Internal Sales Receipt", status: "success", message: `Receipt #${receiptData.doc_number} — ${receiptData.total_units} units` });
+      } else if (receiptData.error?.includes("No sales data")) {
+        steps.push({ step: 5, name: "Internal Sales Receipt", status: "skipped", message: "No internal sales data for this month" });
+      } else {
+        throw new Error(receiptData.error || "Failed to create internal receipt");
+      }
+    } catch (err) {
+      steps.push({ step: 5, name: "Internal Sales Receipt", status: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+
+    // ============ STEP 6: Re-snapshot QB Inventory (Post-Closing) ============
     // Build a map of post-closing QB quantities for variance check
     const postQbByProduct = new Map<string, number>();
     try {
@@ -305,12 +332,12 @@ export async function POST(request: NextRequest) {
       }
 
       await supabase.from("month_end_closings").update({ post_snapshot_at: new Date().toISOString() }).eq("id", closingId);
-      steps.push({ step: 5, name: "QB Inventory Snapshot (Post-Closing)", status: "success", message: `Snapshotted ${qbItems.length} items` });
+      steps.push({ step: 6, name: "QB Inventory Snapshot (Post-Closing)", status: "success", message: `Snapshotted ${qbItems.length} items` });
     } catch (err) {
-      steps.push({ step: 5, name: "QB Inventory Snapshot (Post-Closing)", status: "error", message: err instanceof Error ? err.message : String(err) });
+      steps.push({ step: 6, name: "QB Inventory Snapshot (Post-Closing)", status: "error", message: err instanceof Error ? err.message : String(err) });
     }
 
-    // ============ STEP 6: Variance Check ============
+    // ============ STEP 7: Variance Check ============
     // Compare post-closing QB inventory directly against channel inventory (FBA + 3PL + Manual).
     // Do NOT re-run the full inventory-audit formula (QB Start - Sales = Expected) because
     // after closing, QB already reflects the adjustment + sales receipts — that would double-count.
@@ -364,7 +391,7 @@ export async function POST(request: NextRequest) {
       }).eq("id", closingId);
 
       steps.push({
-        step: 6,
+        step: 7,
         name: "Variance Check",
         status: passed ? "success" : "error",
         message: passed
@@ -373,10 +400,10 @@ export async function POST(request: NextRequest) {
         details: variances.length > 0 ? variances : undefined,
       });
     } catch (err) {
-      steps.push({ step: 6, name: "Variance Check", status: "error", message: err instanceof Error ? err.message : String(err) });
+      steps.push({ step: 7, name: "Variance Check", status: "error", message: err instanceof Error ? err.message : String(err) });
     }
 
-    // ============ STEP 7: Shopify Journal Entry ============
+    // ============ STEP 8: Shopify Journal Entry ============
     try {
       // Sync processor data first
       await fetch(`${request.nextUrl.origin}/api/qb/sync-processors`, {
@@ -407,7 +434,7 @@ export async function POST(request: NextRequest) {
         throw new Error(jeData.error || "Failed to create journal entry");
       }
     } catch (err) {
-      steps.push({ step: 7, name: "Shopify Journal Entry", status: "error", message: err instanceof Error ? err.message : String(err) });
+      steps.push({ step: 8, name: "Shopify Journal Entry", status: "error", message: err instanceof Error ? err.message : String(err) });
     }
 
     // Mark complete
